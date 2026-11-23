@@ -72,6 +72,13 @@ The following examples show how to notify :class:`NARX` the training data from d
     separate the two measurement sessions.
     Because when using multiple-step-ahead prediction, the optimiser relies on the missing values in inputs `X` rather than output `y`, while Auto-Regression models do not have input `X`.
 
+When the training records are concatenated from multiple devices, e.g., several wind turbines, the candidate terms of
+:func:`make_narx` can be selected by cross-validation with the `cv` parameter.
+The folds are split by whole sessions given by `session_sizes`, so that no row of a held-out device is used for
+training, and the time-shifted values of one device are never concatenated to another device.
+In each fold, only the valid rows, whose polynomial time-shifted terms and targets contain no missing values, are
+used for training and validation, and the candidate layout achieving the best validation score is selected to build
+the final model.
 
 One-step-ahead and multiple-step-ahead prediction
 =================================================

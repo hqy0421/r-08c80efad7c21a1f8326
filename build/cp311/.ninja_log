@@ -1,0 +1,7 @@
+# ninja log v7
+22	1530	1795421027570495100	fastcan/narx/_narx_fast.cpython-311-x86_64-linux-gnu.so.p/_narx_fast.pyx.c	63dcb108db70b1aa
+18	1580	1795421027600990700	fastcan/_cancorr_fast.cpython-311-x86_64-linux-gnu.so.p/_cancorr_fast.pyx.c	d9c1edf27875623c
+1582	6384	1795421032645627900	fastcan/_cancorr_fast.cpython-311-x86_64-linux-gnu.so.p/meson-generated__cancorr_fast.pyx.c.o	4b4549e5f8847b87
+6448	6539	1795421032799209700	fastcan/_cancorr_fast.cpython-311-x86_64-linux-gnu.so	bf85048071084cb6
+1534	7161	1795421033417241900	fastcan/narx/_narx_fast.cpython-311-x86_64-linux-gnu.so.p/meson-generated__narx_fast.pyx.c.o	75a2f14ceaf38ee0
+7164	7266	1795421033526930600	fastcan/narx/_narx_fast.cpython-311-x86_64-linux-gnu.so	94be30cad1c00e60

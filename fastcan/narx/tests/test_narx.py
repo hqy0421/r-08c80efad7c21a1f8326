@@ -5,6 +5,7 @@ import pytest
 import torch
 from numpy.testing import assert_allclose, assert_almost_equal, assert_array_equal
 from sklearn.metrics import r2_score
+from sklearn.model_selection import GroupKFold, LeaveOneGroupOut
 from sklearn.utils._array_api import move_to
 from sklearn.utils.estimator_checks import check_estimator, config_context
 
@@ -628,6 +629,161 @@ def test_make_narx_lazy(array_type, monkeypatch):
     narx_lazy.fit(X_np, y_np)
     assert_array_equal(narx_normal.feat_ids, narx_lazy.feat_ids)
     assert_array_equal(narx_normal.delay_ids, narx_lazy.delay_ids)
+
+
+def _make_multi_session_data(n_sessions=4, n_samples_per_session=300, max_delay=3):
+    """Concatenated training records of multiple devices (sessions)."""
+    rng = np.random.default_rng(12345)
+    Xs, ys = [], []
+    for _ in range(n_sessions):
+        e = rng.normal(0, 0.1, n_samples_per_session)
+        u0 = rng.uniform(0, 1, n_samples_per_session + max_delay)
+        u1 = rng.normal(0, 0.1, n_samples_per_session)
+        y = np.zeros(n_samples_per_session + max_delay)
+        for i in range(max_delay, n_samples_per_session + max_delay):
+            y[i] = (
+                0.5 * y[i - 1]
+                + 0.3 * u0[i] ** 2
+                + 2 * u0[i - 1] * u0[i - 3]
+                + 1.5 * u0[i - 2] * u1[i - max_delay]
+                + 1
+            )
+        Xs.append(np.c_[u0[max_delay:], u1])
+        ys.append(y[max_delay:] + e)
+    X = np.vstack(Xs)
+    y = np.concatenate(ys)
+    session_sizes = [n_samples_per_session] * n_sessions
+    return X, y, session_sizes
+
+
+@pytest.mark.parametrize("array_type", ["numpy", "pytorch"])
+@pytest.mark.parametrize("cv", [2, GroupKFold(2), LeaveOneGroupOut()])
+def test_make_narx_cv(cv, array_type, monkeypatch):
+    """Test group-wise cross-validation selection in make_narx."""
+    X, y, session_sizes = _make_multi_session_data()
+    if array_type == "pytorch":
+        monkeypatch.setenv("SCIPY_ARRAY_API", "1")
+        device = (
+            "cuda"
+            if torch.cuda.is_available()
+            else "mps"
+            if torch.mps.is_available()
+            else "cpu"
+        )
+        torch.set_default_device(device)
+        X = torch.tensor(X, dtype=torch.float32)
+        y = torch.tensor(y, dtype=torch.float32)
+    X_np = move_to(X, xp=np, device="cpu")
+    y_np = move_to(y, xp=np, device="cpu")
+
+    with config_context(array_api_dispatch=(array_type == "pytorch")):
+        narx = make_narx(
+            X,
+            y,
+            n_terms_to_select=4,
+            max_delay=3,
+            poly_degree=2,
+            session_sizes=session_sizes,
+            cv=cv,
+            verbose=0,
+        )
+    assert narx.feat_ids.shape[0] == 4
+    narx.fit(X_np, y_np, session_sizes=session_sizes)
+    y_hat = narx.predict(X_np, y_init=y_np[: narx.max_delay_])
+    assert r2_score(*mask_missing_values(y_np, y_hat)) > 0.5
+
+
+def test_make_narx_cv_deterministic():
+    """Check int cv is deterministic and equivalent to GroupKFold."""
+    X, y, session_sizes = _make_multi_session_data()
+    params: dict = {
+        "n_terms_to_select": 4,
+        "max_delay": 3,
+        "poly_degree": 2,
+        "session_sizes": session_sizes,
+        "verbose": 0,
+    }
+    narx_int = make_narx(X, y, cv=3, **params)
+    narx_int2 = make_narx(X, y, cv=3, **params)
+    narx_gkf = make_narx(X, y, cv=GroupKFold(3), **params)
+    assert_array_equal(narx_int.feat_ids, narx_int2.feat_ids)
+    assert_array_equal(narx_int.delay_ids, narx_int2.delay_ids)
+    assert_array_equal(narx_int.feat_ids, narx_gkf.feat_ids)
+    assert_array_equal(narx_int.delay_ids, narx_gkf.delay_ids)
+
+    # Iterable of (train, test) splits
+    groups = np.repeat(np.arange(len(session_sizes)), session_sizes[0])
+    splits = list(GroupKFold(3).split(X, y, groups))
+    narx_iter = make_narx(X, y, cv=splits, **params)
+    assert_array_equal(narx_int.feat_ids, narx_iter.feat_ids)
+    assert_array_equal(narx_int.delay_ids, narx_iter.delay_ids)
+
+
+def test_make_narx_cv_error():
+    """Test error messages of cv in make_narx."""
+    X, y, session_sizes = _make_multi_session_data()
+    params: dict = {
+        "n_terms_to_select": 4,
+        "max_delay": 3,
+        "poly_degree": 2,
+        "session_sizes": session_sizes,
+        "verbose": 0,
+    }
+    with pytest.raises(ValueError, match="should not be greater than the number"):
+        make_narx(X, y, cv=len(session_sizes) + 1, **params)
+    with pytest.raises(ValueError, match="should not be greater than the number"):
+        # cv is not available for a single session
+        make_narx(X, y, cv=2, **{**params, "session_sizes": None})
+    with pytest.raises(ValueError, match=r"`cv` is not supported when `lazy`"):
+        make_narx(X, y, cv=2, lazy=True, **params)
+    with pytest.raises(ValueError, match="The 'cv' parameter"):
+        make_narx(X, y, cv=1, **params)
+
+
+def test_make_narx_cv_nan():
+    """Test cv selection keeps only valid rows in each fold."""
+    X, y, session_sizes = _make_multi_session_data()
+    rng = np.random.default_rng(12345)
+    n_samples = X.shape[0]
+    X_nan = X.copy()
+    y_nan = y.copy()
+    X_nan[rng.choice(n_samples, 30, replace=False)] = np.nan
+    y_nan[rng.choice(n_samples, 20, replace=False)] = np.nan
+    narx = make_narx(
+        X_nan,
+        y_nan,
+        n_terms_to_select=4,
+        max_delay=3,
+        poly_degree=2,
+        session_sizes=session_sizes,
+        cv=4,
+        verbose=0,
+    )
+    assert narx.feat_ids.shape[0] == 4
+    narx.fit(X_nan, y_nan, session_sizes=session_sizes)
+    y_hat = narx.predict(X_nan, y_init=y_nan[: narx.max_delay_])
+    assert r2_score(*mask_missing_values(y_nan, y_hat)) > 0.5
+
+
+def test_make_narx_cv_multi_output():
+    """Test cv selection with multiple outputs."""
+    X, y, session_sizes = _make_multi_session_data()
+    Y = np.c_[y, 0.5 * y + 0.1]
+    narx = make_narx(
+        X,
+        Y,
+        n_terms_to_select=[3, 2],
+        max_delay=3,
+        poly_degree=2,
+        session_sizes=session_sizes,
+        cv=2,
+        verbose=0,
+    )
+    assert narx.feat_ids.shape[0] == 5
+    assert_array_equal(narx.output_ids, [0, 0, 0, 1, 1])
+    narx.fit(X, Y, session_sizes=session_sizes)
+    y_hat = narx.predict(X, y_init=Y[: narx.max_delay_])
+    assert r2_score(*mask_missing_values(Y, y_hat)) > 0.5
 
 
 def test_make_narx_max_candidates():

@@ -8,6 +8,9 @@ from numbers import Integral
 
 import numpy as np
 from scipy.stats import rankdata
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+from sklearn.model_selection import GroupKFold
 from sklearn.utils import (
     check_array,
     check_consistent_length,
@@ -143,6 +146,7 @@ def print_narx(
         ],
         "fit_intercept": ["boolean"],
         "session_sizes": [None, "array-like"],
+        "cv": ["cv_object"],
         "max_candidates": [None, Interval(Integral, 1, None, closed="left")],
         "random_state": ["random_state"],
         "include_zero_delay": [None, "array-like"],
@@ -173,6 +177,7 @@ def make_narx(
     *,
     fit_intercept=True,
     session_sizes=None,
+    cv=None,
     max_candidates=None,
     random_state=None,
     include_zero_delay=None,
@@ -214,6 +219,29 @@ def make_narx(
         If None, the whole data is treated as one session.
 
         .. versionadded:: 0.5.0
+
+    cv : int, cv splitter or iterable of (train, test) splits, default=None
+        Determines the cross-validation splitting strategy used to select
+        the candidate terms. The folds are split by whole sessions
+        (e.g., different measurement devices) given by `session_sizes`,
+        so that no row of a held-out session is used for training, and
+        the time-shifted values of one session are never concatenated to
+        another session. In each fold, only the valid rows, whose
+        polynomial time-shifted terms and targets contain no missing
+        values, are used for training and validation. The candidate
+        layout achieving the best validation R^2 score across the folds
+        is selected to build the final model.
+
+        - None, to select the terms on all valid rows (default).
+        - int, the number of folds of
+          :class:`~sklearn.model_selection.GroupKFold` over the sessions.
+        - An object that yields train/test splits as arrays of indices,
+          e.g., a scikit-learn cv splitter, which is called with the
+          session ids as `groups`.
+
+        Not available when `lazy` is True.
+
+        .. versionadded:: 0.7.0
 
     max_candidates : int, default=None
         Maximum number of candidate polynomial terms retained before selection.
@@ -373,7 +401,27 @@ def make_narx(
         random_state=random_state,
     )
 
-    if lazy:
+    if lazy and cv is not None:
+        raise ValueError("`cv` is not supported when `lazy` is True.")
+
+    if cv is not None:
+        selected_poly_ids = _select_poly_ids_cv(
+            cv,
+            xy_hstack,
+            y,
+            time_shift_ids_all,
+            poly_ids_all,
+            session_sizes_cumsum,
+            max_delay,
+            n_terms_to_select,
+            refine_drop,
+            refine_max_iter,
+            refine_verbose,
+            params,
+            xp=xp,
+            device=device_,
+        )
+    elif lazy:
         sample_mask = xp.ones(n_samples, dtype=xp.bool, device=device_)
         for start in session_sizes_cumsum[:-1]:
             sample_mask[start : start + max_delay] = False
@@ -451,6 +499,113 @@ def make_narx(
         output_ids=output_ids,
         fit_intercept=fit_intercept,
     )
+
+
+def _valid_row_indices(indices, mask_valid):
+    """Convert a fold split to the indices of its valid rows."""
+    indices = np.asarray(indices)
+    if indices.dtype == bool:
+        indices = np.flatnonzero(indices)
+    return indices[mask_valid[indices]]
+
+
+def _select_poly_ids_cv(
+    cv,
+    xy_hstack,
+    y,
+    time_shift_ids,
+    poly_ids,
+    session_sizes_cumsum,
+    max_delay,
+    n_terms_to_select,
+    refine_drop,
+    refine_max_iter,
+    refine_verbose,
+    params,
+    xp=np,
+    device="cpu",
+):
+    """Select candidate terms by session-wise cross-validation.
+
+    The folds are split by whole sessions, so that no row of a held-out
+    session is used for training. In each fold, only the valid rows,
+    whose polynomial time-shifted terms and targets contain no missing
+    values, are used for training and validation. For each output, the
+    candidate layout achieving the best validation R^2 score across the
+    folds is selected.
+    """
+    n_sessions = session_sizes_cumsum.shape[0]
+    if isinstance(cv, Integral):
+        if cv > n_sessions:
+            raise ValueError(
+                f"`cv`={cv} should not be greater than the number of "
+                f"sessions, {n_sessions}."
+            )
+        cv = GroupKFold(n_splits=cv)
+
+    poly_terms = _prepare_poly_terms(
+        xy_hstack,
+        time_shift_ids,
+        poly_ids,
+        session_sizes_cumsum,
+        max_delay,
+        xp=xp,
+    )
+    poly_terms = move_to(poly_terms, xp=np, device="cpu")
+    y = move_to(y, xp=np, device="cpu")
+    # Keep the valid rows only. The first `max_delay` rows of each session
+    # are invalid, as their time-shifted values would otherwise leak
+    # across the session boundary.
+    mask_valid = np.asarray(mask_missing_values(poly_terms, y, return_mask=True))
+
+    session_sizes = np.diff(np.r_[[0], session_sizes_cumsum])
+    groups = np.repeat(np.arange(n_sessions), session_sizes)
+    if hasattr(cv, "split"):
+        splits = list(cv.split(poly_terms, y, groups))
+    else:
+        splits = list(cv)
+
+    n_outputs = y.shape[1]
+    selected_poly_ids = []
+    for i in range(n_outputs):
+        best_score = -np.inf
+        best_support = None
+        for train_idx, test_idx in splits:
+            train_rows = _valid_row_indices(train_idx, mask_valid)
+            test_rows = _valid_row_indices(test_idx, mask_valid)
+            if train_rows.size == 0 or test_rows.size == 0:
+                continue
+            csf = FastCan(
+                n_terms_to_select[i],
+                **params,
+            ).fit(poly_terms[train_rows], y[train_rows, i])
+            if refine_drop is not None:
+                indices, _ = refine(
+                    csf,
+                    drop=refine_drop,
+                    max_iter=refine_max_iter,
+                    verbose=refine_verbose,
+                )
+                support = np.zeros(shape=poly_ids.shape[0], dtype=bool)
+                support[indices] = True
+            else:
+                support = csf.get_support()
+            ols = LinearRegression().fit(
+                poly_terms[train_rows][:, support], y[train_rows, i]
+            )
+            score = r2_score(
+                y[test_rows, i], ols.predict(poly_terms[test_rows][:, support])
+            )
+            if score > best_score:
+                best_score = score
+                best_support = support
+        if best_support is None:
+            raise ValueError(
+                "No valid fold is found for cross-validation. Please check "
+                "that each session has enough valid rows."
+            )
+        selected_poly_ids.append(poly_ids[best_support])
+    return selected_poly_ids
 
 
 def _gen_poly_time_shift_terms(
